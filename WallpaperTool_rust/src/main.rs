@@ -87,8 +87,8 @@ fn is_ipv4(value: &str) -> bool {
 /// 这里不再只筛选 PCI/USB 物理网卡，
 /// 因此 VMware、VPN、虚拟网卡等接口也可以显示。
 fn get_network_info() -> Result<NetworkInfo, Box<dyn std::error::Error>> {
-    let com_con = COMLibrary::new()?;
-    let wmi_con = WMIConnection::new(com_con)?;
+    use std::thread;
+    use std::time::Duration;
 
     let user_path =
         env::var("USERPROFILE").unwrap_or_else(|_| r"C:\".to_string());
@@ -96,55 +96,6 @@ fn get_network_info() -> Result<NetworkInfo, Box<dyn std::error::Error>> {
     let hostname =
         env::var("COMPUTERNAME").unwrap_or_else(|_| "Unknown".to_string());
 
-    // ---------------------------------------------------------------------
-    // 第一步：获取网卡名称与 MAC 映射
-    // ---------------------------------------------------------------------
-    //
-    // NetConnectionID 通常是用户看到的名称：
-    // Ethernet、Wi-Fi、VPN 等。
-    //
-    // 如果 NetConnectionID 没有值，则退回使用 Description 或 Name。
-    #[derive(Deserialize, Debug)]
-    struct Win32NetworkAdapter {
-        #[serde(rename = "MACAddress")]
-        mac_address: Option<String>,
-
-        #[serde(rename = "NetConnectionID")]
-        net_connection_id: Option<String>,
-
-        #[serde(rename = "Name")]
-        name: Option<String>,
-
-        #[serde(rename = "Description")]
-        description: Option<String>,
-    }
-
-    let adapters: Vec<Win32NetworkAdapter> = wmi_con.raw_query(
-        "SELECT MACAddress, NetConnectionID, Name, Description \
-         FROM Win32_NetworkAdapter"
-    )?;
-
-    let mut adapter_names: HashMap<String, String> = HashMap::new();
-
-    for adapter in adapters {
-        let mac = match adapter.mac_address {
-            Some(value) if !value.trim().is_empty() => value,
-            _ => continue,
-        };
-
-        let display_name = adapter
-            .net_connection_id
-            .filter(|v| !v.trim().is_empty())
-            .or(adapter.description)
-            .or(adapter.name)
-            .unwrap_or_else(|| "未知网络接口".to_string());
-
-        adapter_names.insert(mac, display_name);
-    }
-
-    // ---------------------------------------------------------------------
-    // 第二步：获取启用的网络接口和 IP
-    // ---------------------------------------------------------------------
     #[derive(Deserialize, Debug)]
     struct Win32NetworkAdapterConfiguration {
         #[serde(rename = "MACAddress")]
@@ -160,84 +111,110 @@ fn get_network_info() -> Result<NetworkInfo, Box<dyn std::error::Error>> {
         description: Option<String>,
     }
 
-    let configs: Vec<Win32NetworkAdapterConfiguration> =
-        wmi_con.raw_query(
-            "SELECT MACAddress, IPEnabled, IPAddress, Description \
-             FROM Win32_NetworkAdapterConfiguration"
-        )?;
+    let mut last_error = String::new();
 
-    let mut result: Vec<NetAdapter> = Vec::new();
+    // WMI 偶发失败时重试几次
+    for attempt in 0..3 {
+        match query_network_adapters::<Win32NetworkAdapterConfiguration>() {
+            Ok(configs) => {
+                let mut result: Vec<NetAdapter> = Vec::new();
 
-    for config in configs {
-        // 必须有 MAC
-        let mac = match config.mac_address {
-            Some(value) if !value.trim().is_empty() => value,
-            _ => continue,
-        };
+                for config in configs {
+                    // 只处理启用 IP 的接口
+                    if !config.ip_enabled.unwrap_or(false) {
+                        continue;
+                    }
 
-        // 只处理已启用 IP 的网络接口
-        if !config.ip_enabled.unwrap_or(false) {
-            continue;
-        }
+                    let mac = match config.mac_address {
+                        Some(value) if !value.trim().is_empty() => value,
+                        _ => continue,
+                    };
 
-        let mut ips: Vec<String> = Vec::new();
+                    let mut ips: Vec<String> = Vec::new();
 
-        if let Some(ip_list) = config.ip_address {
-            for ip in ip_list {
-                let ip = ip.trim().to_string();
+                    if let Some(ip_list) = config.ip_address {
+                        for ip in ip_list {
+                            let ip = ip.trim().to_string();
 
-                // 只保留 IPv4。
-                // 这样会自动过滤 fe80:: 链路本地 IPv6。
-                if is_ipv4(&ip) {
-                    ips.push(ip);
+                            // 只保留 IPv4，自动排除 IPv6 和 fe80:: 地址
+                            if is_ipv4(&ip) {
+                                ips.push(ip);
+                            }
+                        }
+                    }
+
+                    // 默认过滤无 IPv4 地址的接口
+                    if ips.is_empty() {
+                        continue;
+                    }
+
+                    ips.sort();
+                    ips.dedup();
+
+                    let name = config
+                        .description
+                        .unwrap_or_else(|| "未知网络接口".to_string());
+
+                    result.push(NetAdapter {
+                        name,
+                        mac,
+                        ips,
+                        selected: false,
+                    });
+                }
+
+                // 排序，保证显示顺序稳定
+                result.sort_by(|a, b| {
+                    a.name
+                        .to_lowercase()
+                        .cmp(&b.name.to_lowercase())
+                });
+
+                // 默认勾选第一张有 IP 的网卡
+                if let Some(first) = result.first_mut() {
+                    first.selected = true;
+                }
+
+                return Ok(NetworkInfo {
+                    hostname,
+                    adapters: result,
+                    user_path,
+                });
+            }
+
+            Err(error) => {
+                last_error = error.to_string();
+
+                if attempt < 2 {
+                    thread::sleep(Duration::from_millis(500));
                 }
             }
         }
-
-        // 默认过滤没有 IPv4 的网络接口
-        if ips.is_empty() {
-            continue;
-        }
-
-        ips.sort();
-        ips.dedup();
-
-        let name = adapter_names
-            .get(&mac)
-            .cloned()
-            .or(config.description)
-            .unwrap_or_else(|| "未知网络接口".to_string());
-
-        result.push(NetAdapter {
-            name,
-            mac,
-            ips,
-            // 默认勾选第一张有 IP 的网卡
-            selected: result.is_empty(),
-        });
     }
 
-    // 按名称排序，保证每次显示顺序稳定
-    result.sort_by(|a, b| {
-        a.name
-            .to_lowercase()
-            .cmp(&b.name.to_lowercase())
-    });
+    Err(format!(
+        "WMI 查询网络接口失败，已重试 3 次：{}",
+        last_error
+    )
+    .into())
+}
 
-    // 排序以后，默认选中第一张网卡
-    for adapter in &mut result {
-        adapter.selected = false;
-    }
 
-    if let Some(first) = result.first_mut() {
-        first.selected = true;
-    }
+/// 执行一次 WMI 网络接口查询
+fn query_network_adapters<T>() -> Result<Vec<T>, Box<dyn std::error::Error>>
+where
+    T: for<'de> Deserialize<'de>,
+{
+    let com_con = COMLibrary::new()?;
+    let wmi_con = WMIConnection::new(com_con)?;
 
-    Ok(NetworkInfo {
-        hostname,
-        adapters: result,
-        user_path,
-    })
+    let configs: Vec<T> = wmi_con.raw_query(
+        "SELECT MACAddress, IPEnabled, IPAddress, Description \
+         FROM Win32_NetworkAdapterConfiguration \
+         WHERE IPEnabled = TRUE"
+    )?;
+
+    Ok(configs)
 }
 
 
