@@ -1110,9 +1110,9 @@ fn main() -> Result<(), eframe::Error> {
 
             cc.egui_ctx.set_fonts(fonts);
 
-            Ok(Box::new(WatermarkApp::new(
+            Box::new(WatermarkApp::new(
                 drawing_font,
-            )))
+            ))
         }),
     )
 }
