@@ -1,0 +1,75 @@
+name: Build Windows EXE
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  build-windows:
+    name: Build WallpaperTool for Windows
+    runs-on: windows-latest
+
+    defaults:
+      run:
+        working-directory: WallpaperTool_rust
+
+    steps:
+      - name: Checkout source code
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+          targets: x86_64-pc-windows-msvc
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: WallpaperTool_rust
+
+      - name: Check Rust project
+        run: cargo check --release
+
+      - name: Build release EXE
+        run: cargo build --release
+
+      - name: Prepare package
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path release-package
+
+          Copy-Item `
+            target\release\WallpaperTool.exe `
+            release-package\WallpaperTool.exe
+
+          if (Test-Path README.md) {
+            Copy-Item README.md release-package\README.md
+          }
+
+          Compress-Archive `
+            -Path release-package\* `
+            -DestinationPath WallpaperTool-windows-x64.zip `
+            -Force
+
+      - name: Upload EXE
+        uses: actions/upload-artifact@v4
+        with:
+          name: WallpaperTool-windows-x64
+          path: WallpaperTool_rust/target/release/WallpaperTool.exe
+          if-no-files-found: error
+
+      - name: Upload ZIP package
+        uses: actions/upload-artifact@v4
+        with:
+          name: WallpaperTool-windows-x64-package
+          path: WallpaperTool_rust/WallpaperTool-windows-x64.zip
+          if-no-files-found: error
